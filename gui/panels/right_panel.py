@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (
     QSizePolicy, QStackedWidget,
 )
 
-from gui.modes import MODE_A, MODE_B
+from gui.modes import MODE_LIVE, MODE_A, MODE_B
 from gui.widgets.score_box import ScoreBox
 from gui.widgets.event_table import EventTable
 from gui.widgets.cloud_indicator import CloudIndicator
@@ -20,6 +20,9 @@ class RightDataPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumWidth(240)
+        self._last_predictions = []
+        self._frequency_display = "count"
+        self._action_completed = False
 
         layout = QVBoxLayout(self)
         # Keep every match/training card inside the right glass edge on the
@@ -91,11 +94,13 @@ class RightDataPanel(QWidget):
             "border:1px solid rgba(126,231,255,145);border-radius:8px;padding:8px;")
         l.addWidget(self._action_label)
 
-        lbl2 = QLabel("动作频率统计")
-        lbl2.setAlignment(Qt.AlignCenter)
-        lbl2.setStyleSheet(
+        self._freq_title = QLabel("动作技术统计")
+        self._freq_title.setAlignment(Qt.AlignCenter)
+        self._freq_title.setCursor(Qt.ArrowCursor)
+        self._freq_title.setStyleSheet(
             "color:#58a6ff;font-weight:bold;font-size:11px;border:none;")
-        l.addWidget(lbl2)
+        self._freq_title.mousePressEvent = self._on_frequency_title_clicked
+        l.addWidget(self._freq_title)
 
         # Frequency bars — store references for updates
         self._freq_bars = {}
@@ -123,7 +128,9 @@ class RightDataPanel(QWidget):
         name.setStyleSheet(
             "color:#8b949e;font-size:10px;border:none;min-width:56px;max-width:56px;")
         l.addWidget(name)
-        bar = QLabel("0%")
+        # Frame count is the default display. A zero must read as "0", not
+        # "0%", until a completed pass explicitly enables percentage switching.
+        bar = QLabel("0")
         bar.setAlignment(Qt.AlignCenter)
         bar.setStyleSheet(
             "background:rgba(18,43,64,175);color:{};font-size:9px;font-weight:bold;"
@@ -132,31 +139,89 @@ class RightDataPanel(QWidget):
         return w, bar, bar
 
     def update_frequencies(self, predictions: list):
-        if not predictions:
-            return
-        total = len(predictions)
-        counts = {"forehand": 0, "backhand": 0, "serve": 0, "background": 0}
-        for p in predictions:
-            if p in counts:
-                counts[p] += 1
+        """Compatibility slot for completed output files."""
+        self.update_action_progress(predictions, completed=True)
+
+    def reset_action_progress(self):
+        """Clear side-view counters before a new replay or real task starts."""
+        self._last_predictions = []
+        self._frequency_display = "count"
+        self._action_completed = False
+        self._freq_title.setText("动作帧数统计")
+        self._freq_title.setCursor(Qt.ArrowCursor)
+        for bar in self._freq_bars.values():
+            bar.setText("0")
+        self._action_label.setText("等待数据...")
+        self._action_label.setStyleSheet(
+            "background:rgba(9,27,45,150);color:#b7c6d6;font-size:18px;font-weight:bold;"
+            "border:1px solid rgba(126,231,255,145);border-radius:8px;padding:8px;")
+
+    def update_action_progress(self, predictions: list, completed=False):
+        """Show the number of classifier frames assigned to each action."""
+        self._last_predictions = list(predictions or [])
+        self._action_completed = bool(completed)
+        counts = self._count_action_frames(self._last_predictions)
+        total_frames = len(self._last_predictions)
         for key, bar in self._freq_bars.items():
             cnt = counts.get(key, 0)
-            pct = cnt / total * 100 if total > 0 else 0
-            bar.setText("{:.1f}%".format(pct))
-        self._action_label.setText("数据分析成功")
-        self._action_label.setStyleSheet(
-            "background:rgba(26,127,55,155);color:#efffe9;font-size:16px;font-weight:bold;"
-            "border:1px solid #73e49a;border-radius:8px;padding:8px;")
-        self._header.setText("个人智练看板 ✓")
+            # Every input item represents one classified video frame. Unknown
+            # labels are deliberately excluded, so the four displayed values
+            # can never add up to more than total_frames.
+            pct = cnt / total_frames * 100 if total_frames > 0 else 0
+            bar.setText("{:.1f}%".format(pct) if self._frequency_display == "percent"
+                        else str(cnt))
+        if self._last_predictions:
+            self.set_action(self._last_predictions[-1])
+        if self._action_completed:
+            mode_text = ("动作占比（点击查看动作帧数）"
+                         if self._frequency_display == "percent"
+                         else "动作帧数统计（点击查看占比）")
+            self._freq_title.setText(mode_text)
+            self._freq_title.setCursor(Qt.PointingHandCursor)
+            self._header.setText("个人智练看板 ✓")
+        else:
+            self._freq_title.setText("动作帧数统计")
+            self._freq_title.setCursor(Qt.ArrowCursor)
+
+    @staticmethod
+    def _count_action_frames(predictions):
+        """Count labeled video frames, never more than the input frame count."""
+        counts = {"forehand": 0, "backhand": 0, "serve": 0, "background": 0}
+        for label in predictions or []:
+            label = str(label).strip().lower()
+            if label in counts:
+                counts[label] += 1
+        return counts
+
+    def _on_frequency_title_clicked(self, event):
+        """Percentages are available only after the action pass is complete."""
+        if self._action_completed:
+            self._frequency_display = (
+                "percent" if self._frequency_display == "count" else "count")
+            self.update_action_progress(self._last_predictions, completed=True)
+        event.accept()
 
     # ── Mode switching ───────────────────────────────────────────
 
     def set_mode(self, mode_key):
-        if mode_key == MODE_A:
+        if mode_key == MODE_LIVE:
+            self._stack.setCurrentIndex(0)
+            self._header.setText("实时演示监控")
+        elif mode_key == MODE_A:
             self._stack.setCurrentIndex(0)
             self._header.setText("比赛判罚看板")
         elif mode_key == MODE_B:
             self._stack.setCurrentIndex(1)
+            self._header.setText("个人智练看板")
+
+    def reset_replay(self, mode_key):
+        """Clear only the data panel relevant to a new simulated task."""
+        if mode_key == MODE_A:
+            self.score_box.reset()
+            self.event_table.update_bounce_events([])
+            self._header.setText("比赛判罚看板")
+        elif mode_key == MODE_B:
+            self.reset_action_progress()
             self._header.setText("个人智练看板")
 
     # ── Public slots ─────────────────────────────────────────────

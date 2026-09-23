@@ -49,6 +49,7 @@ class VideoWidget(QWidget):
         self._video_label.setAlignment(Qt.AlignCenter)
         self._video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._video_label.setMinimumSize(320, 180)
+        self._video_label.setCursor(Qt.PointingHandCursor)
         # The label fills the widget. Let the parent receive taps so the
         # top-right close control works on a touch screen as well as a mouse.
         self._video_label.setAttribute(Qt.WA_TransparentForMouseEvents, False)
@@ -58,19 +59,38 @@ class VideoWidget(QWidget):
         layout.addWidget(self._video_label)
 
         self._close_view_btn = QPushButton("✕", self)
-        self._close_view_btn.setFixedSize(40, 40)
+        self._close_view_btn.setFixedSize(48, 44)
         self._close_view_btn.setCursor(Qt.PointingHandCursor)
         self._close_view_btn.setStyleSheet(
             "QPushButton{background:rgba(0,0,0,180);color:#fff;"
-            "border:1px solid #64748b;border-radius:20px;font-size:20px;font-weight:bold;}"
+            "border:1px solid #64748b;border-radius:22px;font-size:23px;font-weight:bold;}"
             "QPushButton:hover{background:#dc2626;border-color:#fecaca;}")
         self._close_view_btn.clicked.connect(self._close_active_view)
         self._close_view_btn.hide()
+
+        self._zoom_view_btn = QPushButton("放大", self)
+        self._zoom_view_btn.setFixedSize(58, 40)
+        self._zoom_view_btn.setCursor(Qt.PointingHandCursor)
+        self._zoom_view_btn.setToolTip("等比例放大视频")
+        self._zoom_view_btn.setStyleSheet(
+            "QPushButton{background:rgba(3,22,40,205);color:#bfeeff;"
+            "border:1px solid #20d3ff;border-radius:10px;font-size:12px;font-weight:bold;}"
+            "QPushButton:hover{background:rgba(13,58,84,230);border-color:#d8ff45;}"
+            "QPushButton:pressed{background:#102f48;}")
+        self._zoom_view_btn.clicked.connect(self._toggle_fullscreen)
+        self._zoom_view_btn.hide()
 
         # Click-to-play/pause
         self.setMouseTracking(True)
         self._paused = True   # start paused for demo videos
         self._auto_pause = False  # auto-pause on first frame for demo
+        # These flags are read by the first decoded result frame, so they
+        # must exist before any replay is allowed to load a video.
+        self._show_pause_overlay = False
+        self._camera_mode = False
+        self._fs_active = False
+        self._panel_visibility_state = None
+        self._last_display_frame = None
 
         # State
         self._cap = None
@@ -107,6 +127,7 @@ class VideoWidget(QWidget):
             self._cap.release()
             self._cap = None
         self._current_frame_num = 0
+        self._last_display_frame = None
         self._show_placeholder_pixmap()
 
     def seek_frame(self, frame_num: int):
@@ -133,7 +154,7 @@ class VideoWidget(QWidget):
         self.update()
 
     def mousePressEvent(self, event):
-        """Click to toggle play/pause, X close, or ⛶ fullscreen."""
+        """Click the video image to toggle play/pause."""
         if self._cap is None and not getattr(self, '_camera_mode', False):
             return
         # Scale click coords
@@ -145,18 +166,6 @@ class VideoWidget(QWidget):
         px = event.pos().x() * sx
         py = event.pos().y() * sy
 
-        # X button — stop camera + restore everything
-        xr = getattr(self, '_x_btn_rect', None)
-        if xr and xr[0] <= px <= xr[0]+xr[2] and xr[1] <= py <= xr[1]+xr[3]:
-            if getattr(self, '_camera_mode', False):
-                self._fs_active = False
-                self.stop_camera_preview()
-                self._restore_all_panels()
-                self.signal_camera_stopped.emit()
-            else:
-                self.clear_video()
-            return
-
         # Toggle play/pause
         if self._paused:
             self.resume()
@@ -165,12 +174,18 @@ class VideoWidget(QWidget):
 
     def _on_video_label_click(self, event):
         """Reliable playback control for the full-size QLabel touch surface."""
-        if self._cap is not None:
-            if self._paused:
-                self.resume()
-            else:
-                self.pause()
+        self.toggle_playback()
         event.accept()
+
+    def toggle_playback(self):
+        """Toggle a completed result video from either mouse or touchscreen."""
+        if self._cap is None or getattr(self, '_camera_mode', False):
+            return False
+        if self._paused:
+            self.resume()
+        else:
+            self.pause()
+        return True
 
     def load_video_paused(self, path, mode_key=None):
         """Load video but keep it paused on first frame. Saves per-mode."""
@@ -182,16 +197,19 @@ class VideoWidget(QWidget):
 
     def clear_video(self):
         """Close current video, return to placeholder."""
+        self._close_fullscreen()
         if self._loaded_mode:
             self._mode_videos.pop(self._loaded_mode, None)
         self._loaded_mode = None
         self.stop()
         self._close_view_btn.hide()
+        self._zoom_view_btn.hide()
         self.show_placeholder("")
         self._show_pause_overlay = False
 
     def set_mode(self, mode_key):
         """Switch to this mode — restore its video if cached."""
+        self._close_fullscreen()
         if mode_key in self._mode_videos:
             path = self._mode_videos[mode_key]
             self._loaded_mode = mode_key
@@ -215,6 +233,7 @@ class VideoWidget(QWidget):
             return
 
         self.stop()
+        self._restore_file_timer()
         self._cap = cv2.VideoCapture(path)
         if not self._cap.isOpened():
             self._video_label.setText("无法打开视频:\n{}".format(path))
@@ -223,10 +242,15 @@ class VideoWidget(QWidget):
 
         self._video_path = path
         self._close_view_btn.show()
+        self._zoom_view_btn.show()
+        self._position_view_buttons()
+        self._zoom_view_btn.raise_()
+        self._close_view_btn.raise_()
         self._fps = self._cap.get(cv2.CAP_PROP_FPS) or 30.0
         self._display_fps_frames = 0
         self._display_fps_started = time.perf_counter()
         self._frame_count = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        self._show_pause_overlay = bool(self._auto_pause)
 
         # Read first frame to show preview
         ret, frame = self._cap.read()
@@ -236,13 +260,23 @@ class VideoWidget(QWidget):
 
         if self._auto_pause:
             self._paused = True
-            self._show_pause_overlay = True
             self._auto_pause = False
         else:
+            self._show_pause_overlay = False
             interval_ms = max(1, int(1000.0 / self._fps))
             self._timer.start(interval_ms)
         self.update()
         self._video_label.update()
+
+    def _restore_file_timer(self):
+        """Reconnect the reusable timer after a camera preview was closed."""
+        self._timer.stop()
+        for callback in (self._next_frame, self._next_camera_frame):
+            try:
+                self._timer.timeout.disconnect(callback)
+            except (TypeError, RuntimeError):
+                pass
+        self._timer.timeout.connect(self._next_frame)
 
     def is_playing(self) -> bool:
         return self._cap is not None and self._timer.isActive()
@@ -263,24 +297,16 @@ class VideoWidget(QWidget):
             self._ai_overlay._log = lambda msg: print("[AI] " + msg)
         return self._ai_overlay.toggle(name)
 
-    def start_camera_preview(self, device="/dev/video12"):
+    def start_camera_preview(self, device="/dev/video21"):
         """Start live camera feed directly in the video widget."""
         self.stop()
-
-        # Start rkaiq 3A engine for auto exposure/white balance
-        import subprocess
-        if subprocess.run(["pgrep", "-f", "rkaiq"],
-                          capture_output=True).returncode != 0:
-            iqfile = "/etc/iqfiles/ov13855_CMK-OT2016-FV1_default.json"
-            subprocess.Popen(["rkaiq_3A_server", "-c", iqfile],
-                             stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL)
-            time.sleep(0.8)  # Wait for 3A init
 
         self._cam_cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
         if not self._cam_cap.isOpened():
             self._video_label.setText("摄像头不可用:\n{}".format(device))
             return False
+        self._cam_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self._cam_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         self._cam_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
         self._cam_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
         self._cam_cap.set(cv2.CAP_PROP_FPS, 30)
@@ -288,6 +314,10 @@ class VideoWidget(QWidget):
         self._cam_h = int(self._cam_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self._camera_mode = True
         self._close_view_btn.show()
+        self._zoom_view_btn.show()
+        self._position_view_buttons()
+        self._zoom_view_btn.raise_()
+        self._close_view_btn.raise_()
         self._cam_count = 0
         self._cam_fps_frames = 0
         self._cam_fps_started = time.perf_counter()
@@ -307,11 +337,10 @@ class VideoWidget(QWidget):
         """Stop the live source and reset every preview state deterministically."""
         self._timer.stop()
         self._camera_mode = False
+        # Invalidate the cached live frame before restoring the layout.  A
+        # queued resize callback must not repaint it over the standby screen.
+        self._last_display_frame = None
         self._close_fullscreen()
-        # Restore bottom bar
-        win = self.window()
-        if win and hasattr(win, 'center_panel'):
-            win.center_panel.show_bottom_bar()
         if hasattr(self, '_cam_cap') and self._cam_cap:
             self._cam_cap.release()
             self._cam_cap = None
@@ -319,6 +348,7 @@ class VideoWidget(QWidget):
         self._current_frame_num = 0
         self._video_path = None
         self._close_view_btn.hide()
+        self._zoom_view_btn.hide()
         self._show_placeholder_pixmap()
         self.signal_camera_status.emit(False, "")
 
@@ -333,39 +363,112 @@ class VideoWidget(QWidget):
             self.stop_camera_preview()
             self.signal_camera_stopped.emit()
         else:
+            self._close_fullscreen()
             self.clear_video()
 
     def _toggle_fullscreen(self):
-        """Simple toggle: hide/show panels around video."""
-        self._fs_active = not getattr(self, '_fs_active', False)
+        """Maximise the current video in-place without rebuilding the UI."""
+        if self._cap is None and not getattr(self, '_camera_mode', False):
+            return
+        if self._fs_active:
+            self._restore_all_panels()
+            return
+
         win = self.window()
         if not win:
             return
-        if self._fs_active:
-            if hasattr(win, '_dock_left'):
-                win._dock_left.close()
-            if hasattr(win, '_dock_right'):
-                win._dock_right.close()
-            if hasattr(win, '_dock_log'):
-                win._dock_log.close()
-            if hasattr(win, 'top_bar'):
-                win.top_bar.hide()
-            if hasattr(win, 'center_panel'):
-                win.center_panel.hide_bottom_bar()
+
+        bottom_bar = None
+        if hasattr(win, 'center_panel'):
+            bottom_bar = win.center_panel.findChild(QWidget, "bottomBar")
+
+        state = {
+            'compact': bool(getattr(win, '_compact', False)),
+            'top_bar': bool(hasattr(win, 'top_bar') and win.top_bar.isVisible()),
+            'left_panel': bool(hasattr(win, 'left_panel') and win.left_panel.isVisible()),
+            'right_panel': bool(hasattr(win, 'right_panel') and win.right_panel.isVisible()),
+            'bottom_bar': bool(bottom_bar is not None and bottom_bar.isVisible()),
+        }
+        for attr in ('_dock_left', '_dock_right', '_dock_log', '_bottom_dock'):
+            panel = getattr(win, attr, None)
+            if panel is not None:
+                state[attr] = bool(panel.isVisible())
+        splitter = getattr(win, '_main_splitter', None)
+        if splitter is not None:
+            state['splitter_sizes'] = list(splitter.sizes())
+
+        self._panel_visibility_state = state
+        self._fs_active = True
+
+        if state['compact']:
+            for attr in ('_dock_left', '_dock_right', '_dock_log'):
+                panel = getattr(win, attr, None)
+                if panel is not None:
+                    panel.hide()
         else:
-            if hasattr(win, 'top_bar'):
-                win.top_bar.show()
-            if hasattr(win, 'center_panel'):
-                win.center_panel.show_bottom_bar()
+            for attr in ('left_panel', 'right_panel', '_bottom_dock'):
+                panel = getattr(win, attr, None)
+                if panel is not None:
+                    panel.hide()
+        if hasattr(win, 'top_bar'):
+            win.top_bar.hide()
+        if hasattr(win, 'center_panel'):
+            win.center_panel.hide_bottom_bar()
+
+        self._zoom_view_btn.setText("还原")
+        self._zoom_view_btn.setToolTip("还原放大前的界面")
+        self._position_view_buttons()
+        self._zoom_view_btn.raise_()
+        self._close_view_btn.raise_()
+        self._schedule_redisplay()
 
     def _restore_all_panels(self):
-        self._fs_active = False
+        """Restore the exact layout that was visible before maximising."""
+        state = self._panel_visibility_state
+        if not state:
+            self._fs_active = False
+            self._zoom_view_btn.setText("放大")
+            self._zoom_view_btn.setToolTip("等比例放大视频")
+            return
+
         win = self.window()
         if win:
             if hasattr(win, 'top_bar'):
-                win.top_bar.show()
+                win.top_bar.setVisible(state.get('top_bar', True))
+
+            if state.get('compact', False):
+                for attr in ('_dock_left', '_dock_right', '_dock_log'):
+                    panel = getattr(win, attr, None)
+                    if panel is not None:
+                        panel.setVisible(state.get(attr, False))
+            else:
+                for attr in ('left_panel', 'right_panel', '_bottom_dock'):
+                    panel = getattr(win, attr, None)
+                    if panel is not None:
+                        panel.setVisible(state.get(attr, False))
+
+            bottom_bar = None
             if hasattr(win, 'center_panel'):
-                win.center_panel.show_bottom_bar()
+                bottom_bar = win.center_panel.findChild(QWidget, "bottomBar")
+            if bottom_bar is not None:
+                bottom_bar.setVisible(state.get('bottom_bar', True))
+
+            splitter = getattr(win, '_main_splitter', None)
+            sizes = state.get('splitter_sizes')
+            if splitter is not None and sizes:
+                splitter.setSizes(sizes)
+                QTimer.singleShot(
+                    0, lambda panel=splitter, saved=list(sizes):
+                    panel.setSizes(saved))
+
+        self._panel_visibility_state = None
+        self._fs_active = False
+        self._zoom_view_btn.setText("放大")
+        self._zoom_view_btn.setToolTip("等比例放大视频")
+        self._position_view_buttons()
+        self._zoom_view_btn.raise_()
+        self._close_view_btn.raise_()
+        self._schedule_redisplay()
 
     def _close_fullscreen(self):
         self._restore_all_panels()
@@ -394,13 +497,11 @@ class VideoWidget(QWidget):
 
         # Keep the source aspect ratio. _display_frame performs a letterboxed
         # fit for the QLabel; resizing to its raw width/height here would
-        # stretch the 16:9 OV13855 image on tall preview panels.
+        # stretch the 16:9 camera image on tall preview panels.
         display = annotated.copy()
 
-        # Overlay info
-        h, w = display.shape[:2]
-
-        # FPS counter (bottom-left)
+        # Keep measurement signals for internal diagnostics, but do not burn a
+        # frame-rate label into the live or recorded video.
         elapsed = time.perf_counter() - self._cam_fps_started
         if elapsed >= 1.0:
             self._cam_fps = self._cam_fps_frames / elapsed
@@ -408,12 +509,6 @@ class VideoWidget(QWidget):
             self._cam_fps_started = time.perf_counter()
             self.signal_camera_fps.emit(self._cam_fps)
             self.signal_display_fps.emit(self._cam_fps)
-        fps_text = "OV13855 {}x{}  {:.1f} fps".format(
-            self._cam_w, self._cam_h,
-            getattr(self, '_cam_fps', 0))
-        cv2.putText(display, fps_text, (8, h - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
-
         self._display_frame(display)
 
     def is_playing(self) -> bool:
@@ -458,6 +553,9 @@ class VideoWidget(QWidget):
         """Convert OpenCV BGR frame to QPixmap and paint overlays."""
         if frame is None:
             return
+        # Keep one unscaled frame so paused result videos resize immediately.
+        # Live camera frames also use this during the short layout transition.
+        self._last_display_frame = frame
 
         # Resize to fit widget while keeping aspect ratio
         h, w = frame.shape[:2]
@@ -523,22 +621,6 @@ class VideoWidget(QWidget):
             painter.drawText(10, 30, "Top {} - {} Bottom".format(self._score_top, self._score_bottom))
 
             painter.end()
-
-        # Draw X close button when video/camera is active
-        has_content = self._video_path or getattr(self, '_camera_mode', False)
-        if has_content:
-            btn_painter = QPainter(pixmap)
-            btn_painter.setRenderHint(QPainter.Antialiasing)
-            btn_w = 28; btn_h = 28
-            x_x = pixmap.width() - 36; btn_y = 8
-            btn_painter.setBrush(QColor(0, 0, 0, 160))
-            btn_painter.setPen(QPen(QColor(255, 255, 255, 100), 1))
-            btn_painter.drawRoundedRect(x_x, btn_y, btn_w, btn_h, 6, 6)
-            btn_painter.setPen(QPen(QColor(255, 255, 255, 220), 2.5))
-            btn_painter.drawLine(x_x+8, btn_y+8, x_x+20, btn_y+20)
-            btn_painter.drawLine(x_x+20, btn_y+8, x_x+8, btn_y+20)
-            self._x_btn_rect = (x_x, btn_y, btn_w, btn_h)
-            btn_painter.end()
 
         # Pause overlay
         if self._show_pause_overlay:
@@ -664,9 +746,33 @@ class VideoWidget(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self._close_view_btn.move(max(4, self.width() - 48), 8)
-        # Re-display current frame at new size
-        if self._cap is not None and hasattr(self, '_current_frame_num'):
-            pass  # next frame will auto-resize
+        self._position_view_buttons()
+        # Re-display the cached frame at the new size. This matters for a
+        # completed result video because it normally starts paused.
+        if getattr(self, '_last_display_frame', None) is not None:
+            self._schedule_redisplay()
         elif hasattr(self, '_placeholder') and not getattr(self, '_camera_mode', False):
             self._show_placeholder_pixmap()
+
+    def _position_view_buttons(self):
+        """Keep the touch controls inside the preview's top-right edge."""
+        if hasattr(self, '_close_view_btn'):
+            self._close_view_btn.move(max(4, self.width() - 56), 8)
+        if hasattr(self, '_zoom_view_btn'):
+            self._zoom_view_btn.move(max(4, self.width() - 120), 8)
+
+    def _redisplay_last_frame(self):
+        """Redraw a paused/current frame after the surrounding layout changes."""
+        self._resize_redraw_pending = False
+        frame = getattr(self, '_last_display_frame', None)
+        if frame is not None:
+            self._display_frame(frame)
+
+    def _schedule_redisplay(self):
+        """Coalesce the resize events caused by hiding several panels."""
+        if getattr(self, '_last_display_frame', None) is None:
+            return
+        if getattr(self, '_resize_redraw_pending', False):
+            return
+        self._resize_redraw_pending = True
+        QTimer.singleShot(0, self._redisplay_last_frame)

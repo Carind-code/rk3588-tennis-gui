@@ -80,6 +80,17 @@ class ScoreBox(QWidget):
 
     # ── Public slot ───────────────────────────────────────────────
 
+    def reset(self):
+        """Restore the empty state before a new match replay starts."""
+        self._score_top.setText("0")
+        self._score_bottom.setText("0")
+        self._reason_label.setText("")
+        self._verdict_label.setText("等待判罚...")
+        self._verdict_label.setStyleSheet(
+            "background:rgba(9,27,45,150);color:#b7c6d6;font-size:13px;"
+            "font-weight:bold;border:1px solid rgba(126,231,255,145);"
+            "border-radius:8px;padding:7px;")
+
     @pyqtSlot(object)
     def update_judgement(self, data: dict):
         if not data:

@@ -10,7 +10,7 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSizePolicy, QStackedWidget,
 )
 
-from gui.modes import MODE_A, MODE_B
+from gui.modes import MODE_LIVE, MODE_A, MODE_B
 from gui.widgets.video_widget import VideoWidget
 from gui.widgets.progress_bar import ProgressBarWidget
 from gui.widgets.action_timeline import ActionTimelineWidget
@@ -73,7 +73,7 @@ class CenterVisualPanel(QWidget):
     # ── Mode switching ───────────────────────────────────────────
 
     def set_mode(self, mode_key):
-        if mode_key == MODE_A:
+        if mode_key in (MODE_LIVE, MODE_A):
             self._stack.setCurrentIndex(0)  # progress bar
         elif mode_key == MODE_B:
             self._stack.setCurrentIndex(0)  # progress bar (no timeline)

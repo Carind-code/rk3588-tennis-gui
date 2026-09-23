@@ -8,17 +8,21 @@ import numpy as np
 from rknnlite.api import RKNNLite
 from pathlib import Path
 import sys
+import math
 
 MODEL_DIR = "/home/elf/rk3588_tennis_system/models"
 MODEL_SIZE = 640
+# BGR colors.  The live overlay deliberately shares the formal side-view
+# visual language, while detection and tracking logic remain untouched.
+NEON_GREEN = (55, 255, 110)
+TRAIL_GREEN = (45, 205, 90)
+TRAIL_DARK = (20, 95, 45)
+MARKER_DARK = (12, 45, 22)
 
 MODELS = {
-    "yolo": {
+    "live_ball": {
         # Six-output INT8 head: the realtime model supplied with detect.7z.
         "rknn": f"{MODEL_DIR}/detect/models/yolo_tennis_ball_head_i8.rknn",
-    },
-    "tracknet": {
-        "rknn": f"{MODEL_DIR}/track/side_tracknet_360x640_sigmoid_fp.rknn",
     },
     "pose": {
         "rknn": f"{MODEL_DIR}/pose/models/yolov8n_pose_i8.rknn",
@@ -33,9 +37,7 @@ class AIOverlay:
         self._models = {}
         self._active = set()
         self._trail = []
-        self._track_frames = []
-        self._track_point = None
-        self._track_trail = []
+        self._live_ball_misses = 0
         self._pose_module = None
         self._log = lambda msg: None
 
@@ -71,8 +73,12 @@ class AIOverlay:
     def toggle(self, name):
         if name in self._active:
             self._active.discard(name)
+            if name == "live_ball":
+                self._reset_live_ball_visual()
             return False
         if self.load(name):
+            if name == "live_ball":
+                self._reset_live_ball_visual()
             self._active.add(name)
             return True
         return False
@@ -86,14 +92,21 @@ class AIOverlay:
         result = frame.copy()
         h, w = result.shape[:2]
 
-        if "yolo" in self._active:
-            result = self._yolo(result, frame, w, h)
-        if "tracknet" in self._active:
-            result = self._tracknet(result, frame, w, h)
+        if "live_ball" in self._active:
+            result = self._live_ball(result, frame, w, h)
         if "pose" in self._active:
             result = self._pose(result, frame, w, h)
 
         return result
+
+    def _reset_live_ball_visual(self):
+        self._trail = []
+        self._live_ball_misses = 0
+
+    def _mark_live_ball_miss(self):
+        self._live_ball_misses += 1
+        if self._live_ball_misses >= 3:
+            self._trail = []
 
     # ── YOLO (exact copy of tennis_ball_detector.py logic) ─────
 
@@ -184,109 +197,133 @@ class AIOverlay:
         boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, h - 1)
         return boxes, np.concatenate(scores_all)
 
-    def _yolo(self, display, frame, w, h):
-        rknn = self._models.get("yolo")
+    def _live_ball(self, display, frame, w, h):
+        rknn = self._models.get("live_ball")
         if rknn is None:
             return display
+
+        cx = cy = None
+        ball_diameter = 0
 
         canvas, scale, pad_x, pad_y = self._letterbox(frame)
         inp = canvas[None]  # (1,640,640,3), RGB uint8, NHWC
 
         output = rknn.inference(inputs=[inp], data_format=["nhwc"])
-        if not output:
+        if output:
+            try:
+                if len(output) == 6:
+                    boxes, scores = self._decode_yolo_heads(output, scale, pad_x, pad_y, w, h)
+                else:
+                    pred = np.asarray(output[0]).squeeze().astype(np.float32)
+                    if pred.ndim != 2:
+                        pred = pred.reshape(pred.shape[0], -1)
+                    if pred.shape[0] <= 16 and pred.shape[1] > pred.shape[0]:
+                        pred = pred.T
+                    if pred.shape[1] >= 5:
+                        scores = pred[:,4] if pred.shape[1] == 5 else np.max(pred[:,4:], axis=1)
+                        valid = scores >= .25
+                        boxes = self._xywh2xyxy(pred[valid, :4])
+                        scores = scores[valid]
+                        boxes[:,[0,2]] = (boxes[:,[0,2]]-pad_x)/scale
+                        boxes[:,[1,3]] = (boxes[:,[1,3]]-pad_y)/scale
+                    else:
+                        boxes = np.empty((0, 4), dtype=np.float32)
+                        scores = np.empty((0,), dtype=np.float32)
+                if len(scores):
+                    idx = self._nms(boxes, scores, 0.45)
+                    if idx:
+                        best = max(idx, key=lambda i: scores[i])
+                        x1,y1,x2,y2 = boxes[best].astype(int)
+                        x1,y1 = max(0,x1), max(0,y1)
+                        x2,y2 = min(w,x2), min(h,y2)
+                        cx, cy = (x1+x2)//2, (y1+y2)//2
+                        ball_diameter = max(2, min(x2 - x1, y2 - y1))
+            except (ValueError, IndexError) as error:
+                self._log("[AI] live ball output decode failed: {}".format(error))
+
+        if cx is None:
+            # YOLO missed (a far-baseline ball is sub-pixel in the 640px
+            # letterbox): fall back to a full-resolution HSV search so the
+            # ball stays visible.
+            color_point = self._hsv_ball_candidate(frame)
+            if color_point is not None:
+                cx, cy = color_point
+                ball_diameter = 8
+
+        if cx is None:
+            self._mark_live_ball_miss()
             return display
 
-        try:
-            if len(output) == 6:
-                boxes, scores = self._decode_yolo_heads(output, scale, pad_x, pad_y, w, h)
-            else:
-                pred = np.asarray(output[0]).squeeze().astype(np.float32)
-                if pred.ndim != 2:
-                    pred = pred.reshape(pred.shape[0], -1)
-                if pred.shape[0] <= 16 and pred.shape[1] > pred.shape[0]:
-                    pred = pred.T
-                if pred.shape[1] < 5:
-                    return display
-                scores = pred[:,4] if pred.shape[1] == 5 else np.max(pred[:,4:], axis=1)
-                valid = scores >= .25
-                boxes = self._xywh2xyxy(pred[valid, :4])
-                scores = scores[valid]
-                boxes[:,[0,2]] = (boxes[:,[0,2]]-pad_x)/scale
-                boxes[:,[1,3]] = (boxes[:,[1,3]]-pad_y)/scale
-        except (ValueError, IndexError) as error:
-            self._log("[AI] YOLO output decode failed: {}".format(error))
-            return display
-
-        if not len(scores):
-            return display
-
-        idx = self._nms(boxes, scores, 0.45)
-        if not idx:
-            return display
-
-        # Match the formal side-view postprocess visual: no detection box or
-        # label; only a red current point, white halo, and fading yellow dots.
-        best = max(idx, key=lambda i: scores[i])
-        x1,y1,x2,y2 = boxes[best].astype(int)
-        x1,y1 = max(0,x1), max(0,y1)
-        x2,y2 = min(w,x2), min(h,y2)
-        cx, cy = (x1+x2)//2, (y1+y2)//2
-
+        self._live_ball_misses = 0
         self._trail.append((cx,cy))
-        if len(self._trail) > 25:
-            self._trail = self._trail[-25:]
+        if len(self._trail) > 18:
+            self._trail = self._trail[-18:]
         # Scale the marker from the detected ball diameter.  This makes a
         # near, large ball visibly larger without letting a noisy box fill the
         # entire preview.
-        ball_diameter = max(2, min(x2 - x1, y2 - y1))
         radius = max(7, min(24, int(round(ball_diameter * .65))))
-        for age, point in enumerate(reversed(self._trail)):
-            dot_radius = max(1, radius - age // 4)
-            color = (0, 0, 255) if age == 0 else (0, 220, 255)
-            cv2.circle(display, point, dot_radius, color, -1, cv2.LINE_AA)
-        cv2.circle(display, (cx, cy), max(5, radius + 2), (0, 0, 255), -1, cv2.LINE_AA)
-        cv2.circle(display, (cx, cy), max(8, radius + 5), (255, 255, 255), 1, cv2.LINE_AA)
+        # Rendering only: use a short, fading green ribbon.  The trail still
+        # uses the detector's raw centres and the marker still uses the raw
+        # detection diameter, so no inference or post-processing is changed.
+        points = self._trail
+        visual_scale = max(0.85, min(1.65, radius / 10.0))
+        for index in range(1, len(points)):
+            fade = index / max(1, len(points) - 1)
+            outer = max(2, int(round((1.5 + 3.0 * fade) * visual_scale)))
+            inner = max(1, int(round((0.8 + 1.5 * fade) * visual_scale)))
+            green = int(120 + 120 * fade)
+            cv2.line(display, points[index - 1], points[index], TRAIL_DARK,
+                     outer + 3, cv2.LINE_AA)
+            cv2.line(display, points[index - 1], points[index],
+                     (35, green, 75), outer, cv2.LINE_AA)
+            cv2.line(display, points[index - 1], points[index], TRAIL_GREEN,
+                     inner, cv2.LINE_AA)
+        for age, point in enumerate(reversed(points[:-1])):
+            fade = 1.0 - age / max(1, len(points) - 1)
+            dot_radius = max(1, int(round(radius * (0.15 + 0.20 * fade))))
+            cv2.circle(display, point, dot_radius, TRAIL_GREEN, -1, cv2.LINE_AA)
+        center = (cx, cy)
+        cv2.circle(display, center, radius + 6, MARKER_DARK, -1, cv2.LINE_AA)
+        cv2.circle(display, center, radius + 3, TRAIL_DARK, -1, cv2.LINE_AA)
+        cv2.circle(display, center, radius, NEON_GREEN, -1, cv2.LINE_AA)
+        cv2.circle(display, center, max(2, radius // 3), (220, 255, 230), -1,
+                   cv2.LINE_AA)
         return display
 
-    # ── TrackNet (HSV fallback) ───────────────────────────────
-
-    def _tracknet(self, display, frame, w, h):
-        rknn = self._models.get("tracknet")
-        if rknn is None:
-            return display
-        small = cv2.resize(frame, (640, 360), interpolation=cv2.INTER_LINEAR)
-        self._track_frames.insert(0, small)
-        self._track_frames = self._track_frames[:3]
-        if len(self._track_frames) < 3:
-            cv2.putText(display, "TrackNet: warming up", (8, 58),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
-            return display
-        current, previous, preprevious = self._track_frames
-        model_input = np.concatenate((current, previous, preprevious), axis=2)[None].astype(np.uint8)
-        output = rknn.inference(inputs=[model_input], data_format=["nhwc"])
-        if not output:
-            return display
-        heatmap = np.asarray(output[0]).squeeze().astype(np.float32).reshape(360, 640)
-        if float(heatmap.min()) < 0.0 or float(heatmap.max()) > 1.0:
-            heatmap = 1.0 / (1.0 + np.exp(-np.clip(heatmap, -60.0, 60.0)))
-        _, score, _, location = cv2.minMaxLoc(heatmap)
-        point = None
-        if score >= .18:
-            candidate = (location[0] * w / 640.0, location[1] * h / 360.0)
-            if self._track_point is None or np.hypot(candidate[0] - self._track_point[0], candidate[1] - self._track_point[1]) <= max(120.0, w * .30):
-                point = candidate
-                self._track_point = point
-        if point is not None:
-            center = (int(point[0]), int(point[1]))
-            self._track_trail.append(center)
-            self._track_trail = self._track_trail[-25:]
-            for index in range(1, len(self._track_trail)):
-                cv2.line(display, self._track_trail[index - 1], self._track_trail[index], (0, 0, 255), 2, cv2.LINE_AA)
-            cv2.circle(display, center, 7, (0, 0, 255), -1, cv2.LINE_AA)
-            cv2.circle(display, center, 10, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(display, "TrackNet {:.0f}%".format(score * 100), (8, 58),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2, cv2.LINE_AA)
-        return display
+    @staticmethod
+    def _hsv_ball_candidate(frame, min_area=8, max_area=40000):
+        """Full-resolution HSV fallback for far balls YOLO cannot resolve."""
+        height, width = frame.shape[:2]
+        resize_scale = min(1.0, 1920.0 / max(width, height))
+        if resize_scale < 1.0:
+            work = cv2.resize(frame, (int(round(width * resize_scale)), int(round(height * resize_scale))), interpolation=cv2.INTER_AREA)
+        else:
+            work = frame
+        hsv = cv2.cvtColor(work, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, (18, 75, 75), (58, 255, 255))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        best = None
+        best_score = -1.0
+        for contour in contours:
+            area = float(cv2.contourArea(contour))
+            if area < min_area * resize_scale * resize_scale or area > max_area * resize_scale * resize_scale:
+                continue
+            perimeter = cv2.arcLength(contour, True)
+            if perimeter <= 1.0:
+                continue
+            circularity = 4.0 * math.pi * area / (perimeter * perimeter)
+            if circularity < 0.45:
+                continue
+            x, y, bw, bh = cv2.boundingRect(contour)
+            ratio = min(bw, bh) / float(max(bw, bh))
+            if ratio < 0.55:
+                continue
+            score = circularity * area
+            if score > best_score:
+                best_score = score
+                best = (int((x + bw / 2.0) / resize_scale), int((y + bh / 2.0) / resize_scale))
+        return best
 
     # ── Pose (NHWC BGR uint8 as per pose_live.py) ────────────
 
@@ -295,16 +332,44 @@ class AIOverlay:
         if runtime is None or self._pose_module is None:
             return display
         poses, npu_ms = runtime.infer(frame)
+        # Compose the wide glow separately so it remains vivid on both dark
+        # indoor scenes and bright court scenes without changing inference.
+        glow = np.zeros_like(display)
         for pose in poses:
-            x1, y1, x2, y2, confidence = pose.box.astype(int)
+            # Rendering only: preserve the real-time pose result, then make a
+            # screen-readable skeleton whose proportions follow person size.
+            person_height = max(1.0, float(pose.box[3] - pose.box[1]))
+            scale = max(0.80, min(2.20, person_height / 260.0))
+            limb_glow = max(7, int(round(11.0 * scale)))
+            limb_outline = max(5, int(round(7.0 * scale)))
+            limb_core = max(3, int(round(4.0 * scale)))
+            joint_radius = max(5, int(round(7.0 * scale)))
             for start, end in self._pose_module.SKELETON:
                 a, b = pose.keypoints[start - 1], pose.keypoints[end - 1]
                 if a[2] >= .35 and b[2] >= .35:
-                    cv2.line(display, (int(a[0]), int(a[1])), (int(b[0]), int(b[1])), (255, 255, 255), 1, cv2.LINE_AA)
+                    pa, pb = (int(a[0]), int(a[1])), (int(b[0]), int(b[1]))
+                    cv2.line(glow, pa, pb, (30, 210, 80), limb_glow,
+                             cv2.LINE_AA)
+                    cv2.line(display, pa, pb, (18, 55, 28), limb_outline,
+                             cv2.LINE_AA)
+                    cv2.line(display, pa, pb, (70, 255, 125), limb_core,
+                             cv2.LINE_AA)
+                    cv2.line(display, pa, pb, (200, 255, 215), 1,
+                             cv2.LINE_AA)
             for index, point in enumerate(pose.keypoints):
                 if point[2] >= .35:
-                    cv2.circle(display, (int(point[0]), int(point[1])), 2,
-                               (0, 255, 255), -1, cv2.LINE_AA)
+                    center = (int(point[0]), int(point[1]))
+                    cv2.circle(glow, center, joint_radius + 6, (0, 210, 255),
+                               -1, cv2.LINE_AA)
+                    cv2.circle(display, center, joint_radius + 3, (18, 55, 28),
+                               -1, cv2.LINE_AA)
+                    cv2.circle(display, center, joint_radius, (0, 225, 255),
+                               -1, cv2.LINE_AA)
+                    cv2.circle(display, center, max(2, joint_radius // 2),
+                               (220, 255, 255), -1, cv2.LINE_AA)
+        # The alpha is intentionally restrained: it reads as a glow rather
+        # than a translucent mask over the player.
+        display[:] = cv2.addWeighted(display, 1.0, glow, 0.28, 0.0)
         cv2.putText(display, "Pose {}  {:.0f} ms".format(len(poses), npu_ms), (8, 76),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 80, 255), 2, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 180), 2, cv2.LINE_AA)
         return display

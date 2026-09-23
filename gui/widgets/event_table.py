@@ -21,7 +21,7 @@ class EventTable(QWidget):
 
     signal_seek_frame = pyqtSignal(int)
 
-    COLUMNS = ["帧号", "场地坐标", "置信度", "判定"]
+    COLUMNS = ["帧号", "落地时间", "场地坐标", "置信度", "判定"]
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -56,9 +56,10 @@ class EventTable(QWidget):
         # Column sizing
         header = self._table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
 
         # Click handler
         self._table.cellClicked.connect(self._on_cell_clicked)
@@ -67,6 +68,7 @@ class EventTable(QWidget):
 
         # Data store
         self._events = []
+        self._video_fps = 30.0
 
     # ── Public slot ───────────────────────────────────────────────
 
@@ -87,12 +89,16 @@ class EventTable(QWidget):
             frame = evt.get("frame", evt.get("frame_num", ""))
             self._set_cell(row_idx, 0, str(frame))
 
+            # The event CSV carries frame indices; derive a stable playback
+            # timestamp when an explicit second value is not present.
+            self._set_cell(row_idx, 1, self._format_event_time(evt, frame))
+
             # Court coordinate (CSV uses x,y, not court_x/court_y)
             cx = evt.get("x", evt.get("court_x", 0))
             cy = evt.get("y", evt.get("court_y", 0))
             coord_text = "({:.0f}, {:.0f})".format(
                 float(cx) if cx else 0, float(cy) if cy else 0)
-            self._set_cell(row_idx, 1, coord_text)
+            self._set_cell(row_idx, 2, coord_text)
 
             # Confidence (CSV uses score)
             conf = evt.get("score", evt.get("confidence", evt.get("conf", 0)))
@@ -102,7 +108,7 @@ class EventTable(QWidget):
             except (ValueError, TypeError):
                 conf_text = "-"
                 conf_val = 0
-            item = self._set_cell(row_idx, 2, conf_text)
+            item = self._set_cell(row_idx, 3, conf_text)
             try:
                 if conf_val >= 0.7:
                     item.setForeground(QBrush(QColor("#3fb950")))
@@ -115,7 +121,7 @@ class EventTable(QWidget):
 
             # Event type as verdict
             evt_type = evt.get("event_type", evt.get("verdict", ""))
-            item = self._set_cell(row_idx, 3, str(evt_type))
+            item = self._set_cell(row_idx, 4, str(evt_type))
             v = str(evt_type).upper()
             if "BOUNCE" in v or "IN" in v:
                 item.setForeground(QBrush(QColor("#3fb950")))
@@ -123,6 +129,24 @@ class EventTable(QWidget):
             elif "OUT" in v:
                 item.setForeground(QBrush(QColor("#f85149")))
                 item.setFont(QFont("DejaVu Sans", 10, QFont.Bold))
+
+    def set_video_fps(self, fps):
+        """Set source FPS used to turn a bounce frame into a time value."""
+        try:
+            fps = float(fps)
+            if fps > 0:
+                self._video_fps = fps
+        except (TypeError, ValueError):
+            pass
+
+    def _format_event_time(self, event, frame):
+        raw = event.get("time_s", event.get("timestamp", event.get("time")))
+        try:
+            seconds = float(raw) if raw not in (None, "") else float(frame) / self._video_fps
+        except (TypeError, ValueError, ZeroDivisionError):
+            return "--:--.--"
+        minutes, seconds = divmod(max(0.0, seconds), 60.0)
+        return "{:02d}:{:05.2f}".format(int(minutes), seconds)
 
     # ── Helpers ───────────────────────────────────────────────────
 

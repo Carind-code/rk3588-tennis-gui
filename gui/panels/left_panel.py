@@ -17,7 +17,7 @@ from PyQt5.QtWidgets import (
     QFrame, QMessageBox, QDialogButtonBox, QSizePolicy,
 )
 
-from gui.modes import MODE_A, MODE_B, get_mode_info
+from gui.modes import MODE_LIVE, MODE_A, MODE_B, get_mode_info
 
 
 # ── Scene Card widget ──────────────────────────────────────────────
@@ -103,6 +103,9 @@ class LeftModePanel(QScrollArea):
         scene_layout = QVBoxLayout(scene_group)
 
         self._cards = {}
+        # Camera preview is now part of both analysis modes.  Keep the legacy
+        # realtime key in the backend for compatibility, but do not expose it
+        # as a third scene card.
         for mk in [MODE_A, MODE_B]:
             card = SceneCard(mk)
             card.clicked.connect(self._on_scene_clicked)
@@ -115,8 +118,8 @@ class LeftModePanel(QScrollArea):
         self._cards[MODE_A].set_active(True)
 
         # ── Device Controls ───────────────────────────────────────
-        ctrl_group = QGroupBox("统一设备控制")
-        ctrl_layout = QVBoxLayout(ctrl_group)
+        self._ctrl_group = QGroupBox("分析输入与上云")
+        ctrl_layout = QVBoxLayout(self._ctrl_group)
 
         # Input source
         src_label = QLabel("视频输入源:")
@@ -125,7 +128,7 @@ class LeftModePanel(QScrollArea):
 
         self._src_group = QButtonGroup(self)
         src_row = QHBoxLayout()
-        self._src_cam = QRadioButton("OV13855 相机")
+        self._src_cam = QRadioButton("摄像头")
         self._src_cam.setChecked(True)
         self._src_file = QRadioButton("本地文件")
         self._src_group.addButton(self._src_cam, 0)
@@ -153,6 +156,7 @@ class LeftModePanel(QScrollArea):
             lambda v: self._src_path.setEnabled(not v))
         self._src_cam.toggled.connect(
             lambda v: self._btn_browse.setEnabled(not v))
+        self._src_cam.toggled.connect(self._on_input_source_changed)
 
         # Cloud toggle
         self._cloud_check = QCheckBox("自动上云 (MQTT + OSS)")
@@ -161,11 +165,11 @@ class LeftModePanel(QScrollArea):
         self._cloud_check.toggled.connect(self._mw.set_cloud)
         ctrl_layout.addWidget(self._cloud_check)
 
-        layout.addWidget(ctrl_group)
+        layout.addWidget(self._ctrl_group)
 
         # ── RUN / STOP ────────────────────────────────────────────
-        run_group = QGroupBox("任务控制")
-        run_layout = QVBoxLayout(run_group)
+        self._run_group = QGroupBox("任务控制")
+        run_layout = QVBoxLayout(self._run_group)
 
         btn_row = QHBoxLayout()
         btn_row.setSpacing(6)
@@ -199,11 +203,18 @@ class LeftModePanel(QScrollArea):
         self._lbl_status.setWordWrap(True)
         run_layout.addWidget(self._lbl_status)
 
-        layout.addWidget(run_group)
+        layout.addWidget(self._run_group)
 
         # ── Quick Actions ─────────────────────────────────────────
-        quick_group = QGroupBox("快捷操作")
-        quick_layout = QVBoxLayout(quick_group)
+        self._quick_group = QGroupBox("俯视视角工具")
+        quick_layout = QVBoxLayout(self._quick_group)
+
+        # Preview comes first: in camera mode the following calibration toggle
+        # is a non-blocking demonstration control, alongside TrackNet and Pose.
+        self._btn_cam = QPushButton("相机实时预览")
+        self._btn_cam.setCursor(Qt.PointingHandCursor)
+        self._btn_cam.clicked.connect(self._on_toggle_camera)
+        quick_layout.addWidget(self._btn_cam)
 
         self._btn_calib = QPushButton("一键标定球场")
         self._btn_calib.setCursor(Qt.PointingHandCursor)
@@ -215,27 +226,21 @@ class LeftModePanel(QScrollArea):
         self._btn_roi.clicked.connect(self._on_roi)
         quick_layout.addWidget(self._btn_roi)
 
-        # Camera preview toggle
-        self._btn_cam = QPushButton("相机实时预览")
-        self._btn_cam.setCursor(Qt.PointingHandCursor)
-        self._btn_cam.clicked.connect(self._on_toggle_camera)
-        quick_layout.addWidget(self._btn_cam)
-
         # ── Realtime AI Models ──
-        ai_model_group = QGroupBox("实时AI模型")
-        ai_layout = QVBoxLayout(ai_model_group)
+        self._ai_model_group = QGroupBox("实时识别模型")
+        ai_layout = QVBoxLayout(self._ai_model_group)
         ai_label = QLabel("摄像头预览时叠加AI效果")
         ai_label.setStyleSheet("color:#8b949e;font-size:9px;border:none;")
         ai_layout.addWidget(ai_label)
 
-        self._btn_yolo = QPushButton("🎯 YOLO 网球检测")
-        self._btn_yolo.setCursor(Qt.PointingHandCursor)
-        self._btn_yolo.setStyleSheet(
+        self._btn_live_ball = QPushButton("🎾 网球实时追踪")
+        self._btn_live_ball.setCursor(Qt.PointingHandCursor)
+        self._btn_live_ball.setStyleSheet(
             "QPushButton{background:#1a3a1a;border:1px solid #3fb950;"
             "border-radius:4px;padding:5px 10px;font-size:11px;color:#c9d1d9;}"
             "QPushButton:hover{background:#2a5a2a;}")
-        self._btn_yolo.clicked.connect(self._on_launch_yolo)
-        ai_layout.addWidget(self._btn_yolo)
+        self._btn_live_ball.clicked.connect(self._on_launch_live_ball)
+        ai_layout.addWidget(self._btn_live_ball)
 
         self._btn_pose = QPushButton("🦴 Pose 人体骨架")
         self._btn_pose.setCursor(Qt.PointingHandCursor)
@@ -246,9 +251,14 @@ class LeftModePanel(QScrollArea):
         self._btn_pose.clicked.connect(self._on_launch_pose)
         ai_layout.addWidget(self._btn_pose)
 
-        quick_layout.addWidget(ai_model_group)
+        quick_layout.addWidget(self._ai_model_group)
 
-        # Camera recording
+        # Camera recording; keep it in one widget so it can be removed from
+        # the two file-processing modes without leaving a vertical gap.
+        self._recording_widget = QWidget()
+        recording_layout = QVBoxLayout(self._recording_widget)
+        recording_layout.setContentsMargins(0, 0, 0, 0)
+        recording_layout.setSpacing(3)
         rec_row = QHBoxLayout()
         self._btn_rec_start = QPushButton("● 录制")
         self._btn_rec_start.setObjectName("btnStartJudgement")
@@ -264,19 +274,52 @@ class LeftModePanel(QScrollArea):
                 "QPushButton{min-height:30px;max-height:30px;padding:0px 8px;}")
         rec_row.addWidget(self._btn_rec_start)
         rec_row.addWidget(self._btn_rec_stop)
-        quick_layout.addLayout(rec_row)
+        recording_layout.addLayout(rec_row)
 
         self._lbl_rec_status = QLabel("")
         self._lbl_rec_status.setStyleSheet("color:#8b949e;font-size:10px;")
-        quick_layout.addWidget(self._lbl_rec_status)
+        recording_layout.addWidget(self._lbl_rec_status)
+        quick_layout.addWidget(self._recording_widget)
 
-        layout.addWidget(quick_group)
+        layout.addWidget(self._quick_group)
 
         layout.addStretch()
         self._cam_preview_on = False
+        self._camera_calib_demo_on = False
         self._is_recording = False
         self._rec_writer = None
         self._operation_locked = False
+        self.apply_mode_layout(MODE_A)
+
+    def apply_mode_layout(self, mode_key):
+        """Present camera controls inside the selected analysis workflow."""
+        is_legacy_live = mode_key == MODE_LIVE
+        is_match = mode_key == MODE_A
+        is_camera = self._src_cam.isChecked()
+
+        # Top/side keep their normal input, cloud and RUN controls.  Selecting
+        # 摄像头 reveals the same independent TrackNet/Pose switches and
+        # recording controls in either workflow.
+        self._ctrl_group.setVisible(not is_legacy_live)
+        self._run_group.setVisible(not is_legacy_live)
+        self._quick_group.setVisible(is_legacy_live or is_match or is_camera)
+        self._btn_calib.setVisible(is_match)
+        # ROI is only meaningful for an imported top-view video.  The
+        # 摄像头 top-view workflow uses its own calibration demonstration.
+        self._btn_roi.setVisible(is_match and not is_camera)
+        self._btn_cam.setVisible(is_legacy_live or is_camera)
+        self._ai_model_group.setVisible(is_legacy_live or is_camera)
+        self._recording_widget.setVisible(is_legacy_live or is_camera)
+
+        if is_legacy_live or is_camera:
+            self._quick_group.setTitle("摄像头实时处理")
+        elif is_match:
+            self._quick_group.setTitle("俯视视角工具")
+
+    def _on_input_source_changed(self, _checked):
+        """Refresh camera-only controls after switching camera/file source."""
+        if hasattr(self, "_quick_group"):
+            self.apply_mode_layout(self._mw._active_mode)
 
     def set_operation_locked(self, locked: bool, allow_live_controls: bool = False):
         """Lock incompatible controls while preserving approved live actions."""
@@ -288,11 +331,14 @@ class LeftModePanel(QScrollArea):
             self._cloud_check,
         ):
             widget.setEnabled(not locked)
-        # Calibration and ROI remain usable during a top-view task.
-        self._btn_calib.setEnabled(True)
-        self._btn_roi.setEnabled(True)
+        # Calibration remains available during a top-view camera preview, just
+        # like the two live overlay controls.  ROI is never available there.
+        can_adjust_court = self._mw._active_mode == MODE_A
+        self._btn_calib.setEnabled(
+            can_adjust_court and (not locked or allow_live_controls))
+        self._btn_roi.setEnabled(can_adjust_court and not locked)
         self._btn_cam.setEnabled(not locked or allow_live_controls)
-        self._btn_yolo.setEnabled(not locked or allow_live_controls)
+        self._btn_live_ball.setEnabled(not locked or allow_live_controls)
         self._btn_pose.setEnabled(not locked or allow_live_controls)
         self._btn_rec_start.setEnabled(not locked or allow_live_controls)
         self._btn_rec_stop.setEnabled(
@@ -318,8 +364,6 @@ class LeftModePanel(QScrollArea):
                 self._btn_cam.setText("关闭预览")
                 self._cam_preview_on = True
                 self.set_operation_locked(True, allow_live_controls=True)
-                self._btn_calib.setEnabled(False)
-                self._btn_roi.setEnabled(False)
 
     def _next_rec_filename(self):
         i = 1
@@ -440,6 +484,21 @@ class LeftModePanel(QScrollArea):
             self._lbl_status.setStyleSheet("color:#d29922;font-size:10px;")
 
     def _on_calibrate(self):
+        """Run file calibration, or toggle the harmless camera demo state."""
+        if self._src_cam.isChecked():
+            self._camera_calib_demo_on = not self._camera_calib_demo_on
+            if self._camera_calib_demo_on:
+                self._btn_calib.setText("一键标定球场 ✓")
+                self._btn_calib.setStyleSheet(
+                    "QPushButton{background:#123d4b;border:2px solid #22d3ee;"
+                    "border-radius:4px;padding:5px 10px;font-size:11px;color:#e0f7ff;}")
+                self._mw._log("[标定] 场地标定模型演示 → ON（不影响实时处理）")
+            else:
+                self._btn_calib.setText("一键标定球场")
+                self._btn_calib.setStyleSheet("")
+                self._mw._log("[标定] 场地标定模型演示 → OFF")
+            return
+
         """Run court calibration via match_judgement infer script."""
         match_dir = os.path.join(self._project_root, "match_judgement")
         script = os.path.join(match_dir, "infer_tracknet_rknn_lite.py")
@@ -459,21 +518,21 @@ class LeftModePanel(QScrollArea):
             "场地标定", "场地标定已启动。\n成功后棋盘格关键点将被锁定复用。",
             QMessageBox.Information)
 
-    def _on_launch_yolo(self):
-        """Toggle YOLO detection overlay on camera."""
-        ok = self._mw.center_panel.video_widget.toggle_ai_overlay("yolo")
+    def _on_launch_live_ball(self):
+        """Toggle the low-latency ball detector and scaled point trail."""
+        ok = self._mw.center_panel.video_widget.toggle_ai_overlay("live_ball")
         if ok:
-            self._btn_yolo.setText("🎯 YOLO 网球检测 ✓")
-            self._btn_yolo.setStyleSheet(
+            self._btn_live_ball.setText("🎾 网球实时追踪 ✓")
+            self._btn_live_ball.setStyleSheet(
                 "QPushButton{background:#2a5a2a;border:2px solid #3fb950;"
                 "border-radius:4px;padding:5px 10px;font-size:11px;color:#fff;}")
-            self._mw._log("[YOLO] 网球检测叠加 → ON")
+            self._mw._log("[Ball Detect] 网球检测与缩放轨迹叠加 → ON")
         else:
-            self._btn_yolo.setText("🎯 YOLO 网球检测")
-            self._btn_yolo.setStyleSheet(
+            self._btn_live_ball.setText("🎾 网球实时追踪")
+            self._btn_live_ball.setStyleSheet(
                 "QPushButton{background:#1a3a1a;border:1px solid #3fb950;"
                 "border-radius:4px;padding:5px 10px;font-size:11px;color:#c9d1d9;}")
-            self._mw._log("[YOLO] 网球检测叠加 → OFF")
+            self._mw._log("[Ball Detect] 网球检测与缩放轨迹叠加 → OFF")
 
     def _on_launch_pose(self):
         """Toggle Pose skeleton overlay."""

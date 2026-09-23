@@ -4,7 +4,7 @@
 Camera Preprocessing Pipeline — RK3588 optimized.
 
 Flow:
-  V4L2 (/dev/video11 ISP) → NV12 1920×1080
+  V4L2 (/dev/video21 USB) → MJPG 1920×1080
   → Resize ONCE to 640×360 BGR (OpenCV ~2ms)
   → Ring Buffer stores RESIZED frames (3 frames: t, t-1, t-2)
   → Tensor: direct slice copy (no re-resize) → 9-channel uint8
@@ -55,7 +55,7 @@ class RingBuffer:
 class CameraPipeline:
     """Live camera → optimized tensor assembly."""
 
-    def __init__(self, device="/dev/video11"):
+    def __init__(self, device="/dev/video21"):
         self.device = device
         self.cap = None
         self.running = False
@@ -75,6 +75,8 @@ class CameraPipeline:
         self.cap = cv2.VideoCapture(self.device, cv2.CAP_V4L2)
         if not self.cap.isOpened():
             return False
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
         self.cap.set(cv2.CAP_PROP_FPS, 30)

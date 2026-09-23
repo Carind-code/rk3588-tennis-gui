@@ -1,52 +1,37 @@
-# Python
+# Python cache and local editor state
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-*.egg-info/
-.eggs/
-build/
-dist/
-
-# Qt / PyQt
-*.qmlc
-*.qmltc
-*.qmlproject.user*
-
-# IDE / Editor
+.pytest_cache/
 .vscode/
-.idea/
-*.swp
-*.swo
-*~
-.DS_Store
-Thumbs.db
 
-# Runtime outputs (do not track recordings / captures)
-gui/outputs/
-gui/outputs/recordings/
+# Model binaries (.rknn) are committed for reproducibility.
+*.onnx
+*.pt
+*.pth
+*.tflite
+
+# Local video, calibration data, results, recordings, and logs
 *.mp4
 *.avi
 *.mov
 *.mkv
-*.yuv
-*.raw
-*.npy
-
-# Logs
+*.csv
 *.log
-cloud_process.log
+*.npy
+*.npz
+outputs/
+demo_results/
+backups/
+archive/
+test_videos/
+gui/outputs/
 
-# Local config / secrets
-match_judgement/cloud/config.json
-*.secret
-.env
+# Private cloud credentials
+**/config.json
+!**/config.example.json
 
-# Models (too large for git, use separate storage)
-*.rknn
-*.onnx
-*.pt
-*.pth
-*.weights
-models/
+# Local runtime artifacts
+*.swp
+*.tmp
+=
+*_prediction.txt

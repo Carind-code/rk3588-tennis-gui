@@ -1,0 +1,19 @@
+{
+  "iot": {
+    "host_name": "your-product-key.iot-as-mqtt.cn-shanghai.aliyuncs.com",
+    "product_key": "your_product_key",
+    "device_name": "your_device_name",
+    "device_secret": "your_device_secret",
+    "topic": "/your_product_key/your_device_name/user/update"
+  },
+  "oss": {
+    "access_key_id": "your_access_key_id",
+    "access_key_secret": "your_access_key_secret",
+    "endpoint": "oss-cn-shanghai.aliyuncs.com",
+    "bucket_name": "your_bucket_name",
+    "url_prefix": "https://your_bucket_name.oss-cn-shanghai.aliyuncs.com/",
+    "env": "dev"
+  },
+  "coord_batch_size": 20,
+  "coord_max_wait_time": 0.5
+}

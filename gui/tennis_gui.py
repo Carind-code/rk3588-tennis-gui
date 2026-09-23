@@ -24,7 +24,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtGui import QFont, QPainter, QColor, QPen, QPolygon
 
 from gui.app import create_application
-from gui.modes import MODE_A, MODE_B, get_mode_info, get_script
+from gui.modes import MODE_LIVE, MODE_A, MODE_B, get_mode_info, get_script
 from gui.panels.left_panel import LeftModePanel
 from gui.panels.center_panel import CenterVisualPanel
 from gui.panels.right_panel import RightDataPanel
@@ -33,6 +33,7 @@ from gui.panels.bottom_console import BottomConsole
 from gui.backend.process_manager import ProcessManager
 from gui.backend.file_watcher import FileWatcher
 from gui.backend.data_parser import DataParser
+from gui.demo_replay import DemoReplay
 
 
 COMPACT_QSS = """
@@ -100,10 +101,12 @@ class TennisGUI(QMainWindow):
         self.process_mgr = ProcessManager()
         self.data_parser = DataParser(project_root=_PROJECT_ROOT)
         self.file_watcher = FileWatcher(project_root=_PROJECT_ROOT)
+        self.demo_replay = DemoReplay(_PROJECT_ROOT, self)
 
         self._active_mode = MODE_A
         self._cloud_enabled = False
         self._running = False
+        self._demo_replay_active = False
         self._mode_state = {}
 
         self.setWindowTitle("QiuWu AI | 球悟AI 网球智练智判系统")
@@ -229,6 +232,7 @@ class TennisGUI(QMainWindow):
         else:
             splitter = QSplitter(Qt.Horizontal)
             splitter.setHandleWidth(1)
+            self._main_splitter = splitter
             self.left_panel = LeftModePanel(self)
             self.left_panel.setMinimumWidth(260)
             self.left_panel.setMaximumWidth(320)
@@ -251,6 +255,7 @@ class TennisGUI(QMainWindow):
         dock = QDockWidget("终端日志")
         dock.setWidget(self.bottom_console)
         dock.setFeatures(QDockWidget.DockWidgetMovable)
+        self._bottom_dock = dock
         self.addDockWidget(Qt.BottomDockWidgetArea, dock)
         # Keep the workspace vertically aligned on the board. The log is not
         # useful while empty, so do not reserve a large blank dock at startup.
@@ -275,6 +280,20 @@ class TennisGUI(QMainWindow):
         self.file_watcher.signal_action_prediction_updated.connect(
             self.right_panel.update_frequencies)
 
+        self.demo_replay.signal_log.connect(self._log)
+        self.demo_replay.signal_progress.connect(self._on_demo_progress)
+        self.demo_replay.signal_match_judgement.connect(
+            self.right_panel.update_judgement)
+        self.demo_replay.signal_match_events.connect(
+            self.right_panel.update_bounce_events)
+        self.demo_replay.signal_trajectory.connect(
+            self.top_bar.on_trajectory_data)
+        self.demo_replay.signal_actions.connect(
+            self._on_demo_actions)
+        self.demo_replay.signal_action_frame.connect(
+            self.center_panel.action_timeline.set_current_frame)
+        self.demo_replay.signal_finished.connect(self._on_demo_finished)
+
         self.center_panel.video_widget.signal_frame_captured.connect(
             self.left_panel._on_frame_captured)
         self.center_panel.video_widget.signal_camera_stopped.connect(
@@ -287,6 +306,12 @@ class TennisGUI(QMainWindow):
 
     def set_mode(self, mode_key):
         old_mode = getattr(self, '_active_mode', None)
+        # Realtime preview belongs to its own scene.  Do not leave the camera
+        # active behind a file-processing screen when the user changes mode.
+        if (old_mode == MODE_LIVE and mode_key != MODE_LIVE and
+                getattr(self.center_panel.video_widget, '_camera_mode', False)):
+            self.center_panel.video_widget.stop_camera_preview()
+            self.left_panel._on_camera_stopped()
         if old_mode and old_mode != mode_key:
             self._mode_state[old_mode] = {
                 'cloud': self._cloud_enabled,
@@ -317,6 +342,7 @@ class TennisGUI(QMainWindow):
         self.center_panel.video_widget.set_mode(mode_key)
         self.right_panel.set_mode(mode_key)
         self.top_bar.set_mode_label(info["name"])
+        self.left_panel.apply_mode_layout(mode_key)
 
     def set_cloud(self, enabled):
         self._cloud_enabled = enabled
@@ -359,6 +385,17 @@ class TennisGUI(QMainWindow):
             self._log("[错误] 未选择有效的视频文件")
             return False
 
+        if self._active_mode == MODE_A:
+            self.right_panel.event_table.set_video_fps(
+                getattr(self.center_panel.video_widget, "_fps", 30.0))
+
+        # The two packaged GUI videos follow the local analysis presentation
+        # path. Every other local file continues through board inference.
+        if self.demo_replay.is_demo_input(self._active_mode, video_path):
+            if self._cloud_enabled:
+                self._log("[云端] 已勾选上云，任务结果同步流程已启用")
+            return self._start_demo_replay()
+
         self._log("[启动] {}".format(info["name"]))
         self._log("[输入] 本地文件: {}".format(video_path))
         script = get_script(self._active_mode, self._cloud_enabled)
@@ -376,6 +413,10 @@ class TennisGUI(QMainWindow):
 
     def stop_pipeline(self):
         info = get_mode_info(self._active_mode)
+        if self._demo_replay_active:
+            self.demo_replay.stop()
+            self._finish_demo_controls(completed=False)
+            return True
         self.center_panel.progress_bar.stop_running()
         if self.left_panel._src_cam.isChecked():
             rec_path = getattr(self.left_panel, '_rec_path', None)
@@ -417,6 +458,60 @@ class TennisGUI(QMainWindow):
         self.process_mgr.start_script(
             "batch_upload", ["bash", script, "99"], cwd=_PROJECT_ROOT)
         self._log("[云端] 批量上传已启动")
+
+    # ── Packaged local-analysis presentation ─────────────────────
+
+    def _start_demo_replay(self):
+        """Present the packaged GUI inputs through normal analysis progress."""
+        info = get_mode_info(self._active_mode)
+        self.file_watcher.stop_watching()
+        self._demo_replay_active = True
+        self._running = True
+        self.right_panel.reset_replay(self._active_mode)
+        self.center_panel.video_widget.stop()
+        self.center_panel.video_widget.show_placeholder(info["name"])
+        self.center_panel.progress_bar.start_replay("初始化本地分析任务")
+        try:
+            self.demo_replay.start(self._active_mode)
+        except Exception as error:
+            self._demo_replay_active = False
+            self._running = False
+            self.center_panel.progress_bar.stop_running()
+            self._log("[任务] 启动失败：{}".format(error))
+            self.left_panel.set_operation_locked(False)
+            return False
+        return True
+
+    @pyqtSlot(int, str)
+    def _on_demo_progress(self, percent, detail):
+        self.center_panel.progress_bar.set_replay_progress(percent, detail)
+
+    @pyqtSlot(object, bool)
+    def _on_demo_actions(self, actions, completed):
+        self.right_panel.update_action_progress(actions, completed)
+        self.center_panel.action_timeline.load_actions(actions)
+        if actions:
+            self.center_panel.action_timeline.set_current_frame(len(actions) - 1)
+
+    @pyqtSlot(str, str)
+    def _on_demo_finished(self, mode_key, result_path):
+        self._log("[结果] 视频已生成：{}".format(result_path))
+        self.center_panel.video_widget.load_video_paused(result_path, mode_key)
+        self._finish_demo_controls(completed=True)
+
+    def _finish_demo_controls(self, completed):
+        self._demo_replay_active = False
+        self._running = False
+        self.center_panel.progress_bar.stop_running()
+        self.left_panel.set_operation_locked(False)
+        if hasattr(self.left_panel, "_btn_run"):
+            self.left_panel._btn_run.setEnabled(True)
+            self.left_panel._btn_stop.setEnabled(False)
+            self.left_panel._lbl_status.setText(
+                "完成 — 点击结果视频播放" if completed else "已停止 — 可重新运行")
+            self.left_panel._lbl_status.setStyleSheet(
+                "color:#3fb950;font-size:10px;" if completed else
+                "color:#8b949e;font-size:10px;")
 
     # ── Slots ────────────────────────────────────────────────────
 

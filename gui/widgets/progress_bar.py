@@ -19,11 +19,15 @@ class ProgressBarWidget(QWidget):
         self._cloud_visible = False
         self._phase = "就绪"
         self._pulse_pos = 0
+        self._replay_active = False
+        self._replay_percent = 0
+        self._replay_detail = ""
         self._pulse_timer = QTimer(self)
         self._pulse_timer.timeout.connect(self._pulse)
 
     def start_running(self, cloud=False):
         self._running = True
+        self._replay_active = False
         self._cloud_visible = cloud
         self._cloud_pct = 0
         self._phase = "流水线运行中..."
@@ -33,6 +37,7 @@ class ProgressBarWidget(QWidget):
 
     def stop_running(self):
         self._running = False
+        self._replay_active = False
         self._pulse_timer.stop()
         self._phase = "完成"
         self.update()
@@ -49,6 +54,27 @@ class ProgressBarWidget(QWidget):
         self._cloud_visible = False
         self._phase = "就绪"
         self._pulse_pos = 0
+        self._replay_active = False
+        self._replay_percent = 0
+        self._replay_detail = ""
+        self.update()
+
+    def start_replay(self, detail):
+        """Show determinate progress for a packaged local analysis task."""
+        self._running = True
+        self._cloud_visible = False
+        self._replay_active = True
+        self._replay_percent = 0
+        self._replay_detail = detail
+        self._pulse_timer.stop()
+        self.update()
+
+    def set_replay_progress(self, percent, detail=None):
+        self._replay_active = True
+        self._running = True
+        self._replay_percent = max(0, min(100, int(percent)))
+        if detail:
+            self._replay_detail = detail
         self.update()
 
     def _pulse(self):
@@ -67,7 +93,22 @@ class ProgressBarWidget(QWidget):
         font = QFont("DejaVu Sans", 9)
         painter.setFont(font)
 
-        if self._running:
+        if self._running and self._replay_active:
+            label_y, bar_y = max(16, h - 31), max(21, h - 26)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#1f3346"))
+            painter.drawRoundedRect(margin, bar_y, bar_w, bar_h, 4, 4)
+            painter.setBrush(QColor("#58a6ff"))
+            painter.drawRoundedRect(margin, bar_y,
+                                    int(bar_w * self._replay_percent / 100),
+                                    bar_h, 4, 4)
+            painter.setPen(QColor("#bfeeff"))
+            painter.drawText(margin, label_y,
+                             "本地分析 · {}".format(self._replay_detail))
+            painter.setPen(QColor("#d8ff45"))
+            painter.drawText(max(margin, w - 62), label_y,
+                             "{}%".format(self._replay_percent))
+        elif self._running:
             # Indeterminate pulsing bar
             pw = int(bar_w * 0.25)
             px = int((bar_w - pw) * self._pulse_pos / 100)

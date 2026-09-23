@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+camera_work/
+input.mp4
+tracknet_rknn_output.*
+bounce_events.csv
+judgement.json
+cloud/config.json
+*.log

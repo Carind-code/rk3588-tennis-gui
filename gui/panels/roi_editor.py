@@ -47,7 +47,8 @@ class ROIEditor:
             self.frame = cv2.imread(image_path)
         else:
             # Grab one frame from camera
-            cap = cv2.VideoCapture("/dev/video11", cv2.CAP_V4L2)
+            cap = cv2.VideoCapture("/dev/video21", cv2.CAP_V4L2)
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
             ret, self.frame = cap.read()
